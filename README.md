@@ -1,19 +1,21 @@
 # Multimedia Commons Meilisearch Uploader
 
-A high-performance Rust application that streams images from an S3 bucket, filters out monocolor images, and uploads them to Meilisearch in batches with full parallelization and constant memory usage.
+A high-performance Rust application with a concurrent pipeline architecture that streams images from an S3 bucket, processes them in parallel, and uploads them to Meilisearch with optimal throughput and constant memory usage.
 
 ## Features
 
-- **Streaming Architecture**: Memory-efficient streaming of S3 objects without loading all keys into memory
+- **Concurrent Pipeline Architecture**: Three-stage pipeline with S3 listing, image processing, and uploading running concurrently
+- **True Streaming**: Processing starts immediately as images are discovered, no waiting for full S3 scan
+- **Memory Efficient**: Constant memory usage regardless of dataset size using channels and bounded queues
 - **S3 Integration**: Recursively scans S3 buckets using rusty-s3 with pagination
-- **Image Processing**: Supports JPEG and PNG images with intelligent monocolor filtering
-- **Parallel Processing**: Fully parallelized downloads and uploads using tokio
-- **Batch Upload**: Intelligent batching with size limits (100MB default)
-- **Retry Logic**: Built-in retry mechanism with exponential backoff
-- **Base64 Encoding**: Converts images to base64 for storage
-- **Configurable**: Command-line options for all parameters
-- **Dry Run Mode**: Test without actually uploading to Meilisearch
-- **Progress Tracking**: Real-time statistics and progress monitoring
+- **Parallel Image Processing**: Configurable concurrent image downloads and processing
+- **Intelligent Filtering**: Advanced monocolor detection with compression artifact tolerance
+- **Smart Batching**: Dynamic batch uploading with size and count limits
+- **Built-in Resilience**: Retry logic with exponential backoff for transient failures
+- **Base64 Encoding**: Converts images to base64 for Meilisearch storage
+- **Highly Configurable**: Command-line options for all performance parameters
+- **Dry Run Mode**: Test configuration without uploading to Meilisearch
+- **Real-time Monitoring**: Live progress tracking and detailed statistics
 
 ## Installation
 
@@ -116,32 +118,59 @@ For public buckets, the application will attempt anonymous access if no credenti
 
 ## Performance
 
-The application is designed for high performance and memory efficiency with:
+The application uses a **concurrent pipeline architecture** for maximum performance:
 
-- **Streaming S3 Processing**: Uses Rust Streams to process S3 objects without loading all keys into memory
-- **Constant Memory Usage**: Processes images in streaming batches, maintaining constant memory footprint regardless of dataset size
-- **Parallel S3 object listing**: Uses continuation tokens for paginated S3 API calls
-- **Concurrent image downloads**: Semaphore-based rate limiting for optimal throughput
-- **Efficient monocolor detection**: Grid-based pixel sampling with compression artifact tolerance
-- **Intelligent batch processing**: Minimizes Meilisearch API calls while respecting size limits
-- **Built-in retry logic**: Exponential backoff for transient failures
-- **Real-time progress tracking**: Detailed statistics and progress monitoring
+### Pipeline Architecture
+```
+S3 Lister → [Channel] → Image Processor → [Channel] → Batch Uploader
+    ↓                        ↓                          ↓
+Discovers images         Downloads &                Uploads to
+continuously            processes images            Meilisearch
+                        in parallel                 in batches
+```
+
+- **Concurrent Execution**: All three stages run simultaneously for maximum throughput
+- **No Blocking**: Image processing starts immediately as images are discovered
+- **Constant Memory**: Bounded channels prevent memory buildup regardless of dataset size
+- **Configurable Parallelism**: Control concurrent downloads and uploads independently
+- **Efficient Resource Usage**: CPU, network, and memory optimally utilized
+
+### Performance Features
+- **S3 Streaming**: Continuous S3 object discovery with pagination
+- **Parallel Processing**: Up to N concurrent image downloads/processing (configurable)
+- **Smart Batching**: Dynamic batching with size and count limits for optimal API usage
+- **Advanced Filtering**: Grid-based monocolor detection with compression tolerance
+- **Retry Logic**: Exponential backoff for transient failures
+- **Real-time Stats**: Live progress monitoring across all pipeline stages
 
 ### Performance Tuning
 
-- Adjust `--max-downloads` based on your network bandwidth and S3 rate limits (default: 50)
-- Adjust `--max-uploads` based on your Meilisearch instance capacity (default: 10)
-- Use `--batch-size` to control processing batch size - larger batches improve parallelization (default: 100)
-- The streaming architecture maintains constant memory usage regardless of dataset size
-- Monitor the progress output to gauge optimal concurrency settings for your environment
+**Throughput Optimization:**
+- `--max-downloads`: Controls concurrent image processing (default: 50)
+  - Higher values = more parallel processing but more memory/CPU usage
+  - Tune based on your system resources and S3 rate limits
+- `--max-uploads`: Controls Meilisearch upload concurrency (default: 10)
+  - Tune based on your Meilisearch instance capacity
+- `--batch-size`: Documents per upload batch (default: 100)
+  - Larger batches = fewer API calls but more memory per batch
+
+**Memory Management:**
+- Channel buffer sizes are automatically tuned for optimal memory usage
+- The pipeline maintains constant memory regardless of dataset size
+- Processing memory scales with `--max-downloads` setting only
+
+**Monitoring:**
+- Watch the live output to see pipeline balance
+- Optimal setup: S3 discovery keeps ahead of processing, processing keeps ahead of uploads
 
 ## Image Processing
 
 - **Supported Formats**: JPEG, PNG (detected by file extension)
 - **Advanced Monocolor Detection**: Grid-based pixel sampling with tolerance for compression artifacts (<1% variation threshold)
 - **Base64 Encoding**: All valid images are encoded to base64 for Meilisearch storage
-- **Streaming Processing**: Images are processed as they are discovered, not batched in memory
-- **Error Handling**: Failed downloads/processing are logged and counted but don't stop the process
+- **Pipeline Processing**: Images flow through the pipeline as discovered - no batching in memory
+- **Concurrent Downloads**: Multiple images processed simultaneously with semaphore-based rate limiting
+- **Graceful Error Handling**: Failed downloads/processing are logged and counted but don't stop the pipeline
 
 ## Dependencies
 
@@ -171,15 +200,21 @@ The application includes comprehensive error handling:
 
 1. **Certificate Errors**: Make sure your system time is correct and you have updated CA certificates
 2. **Access Denied**: Verify your AWS credentials have S3 read permissions
-3. **Out of Memory**: Reduce `--batch-size` or `--max-downloads` if processing large images
-4. **Meilisearch Errors**: Check that your Meilisearch URL and API key are correct
+3. **Out of Memory**: Reduce `--max-downloads` if processing very large images (the pipeline itself uses constant memory)
+4. **Slow Processing**: Increase `--max-downloads` for more parallel processing, but watch system resources
+5. **Meilisearch Errors**: Check that your Meilisearch URL and API key are correct
+6. **Pipeline Stalls**: If one stage becomes a bottleneck, tune the related concurrency parameters
 
 ### Testing
 
-Use the `--dry-run` flag to test your configuration without uploading to Meilisearch:
+Use the `--dry-run` flag to test the pipeline without uploading to Meilisearch:
 
 ```bash
-./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-downloads 5
+# Test with lower concurrency to see pipeline stages clearly
+./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-downloads 5 --batch-size 10
+
+# Test with higher concurrency for performance evaluation
+./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-downloads 20 --batch-size 50
 ```
 
 ## License
