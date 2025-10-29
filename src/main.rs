@@ -36,10 +36,7 @@ struct Args {
     meilisearch_url: String,
 
     /// Meilisearch API key
-    #[arg(
-        long,
-        default_value = "0d330f6cbb050b59c30234491ee469a43b2e9c48bfcbea4776e2c7d38792d96a"
-    )]
+    #[arg(long)]
     meilisearch_key: String,
 
     /// Maximum concurrent downloads
