@@ -1,17 +1,19 @@
 # Multimedia Commons Meilisearch Uploader
 
-A high-performance Rust application that recursively reads images from an S3 bucket, filters out monocolor images, and uploads them to Meilisearch in batches with full parallelization.
+A high-performance Rust application that streams images from an S3 bucket, filters out monocolor images, and uploads them to Meilisearch in batches with full parallelization and constant memory usage.
 
 ## Features
 
-- **S3 Integration**: Recursively scans S3 buckets using rusty-s3
-- **Image Processing**: Supports JPEG and PNG images with monocolor filtering
+- **Streaming Architecture**: Memory-efficient streaming of S3 objects without loading all keys into memory
+- **S3 Integration**: Recursively scans S3 buckets using rusty-s3 with pagination
+- **Image Processing**: Supports JPEG and PNG images with intelligent monocolor filtering
 - **Parallel Processing**: Fully parallelized downloads and uploads using tokio
 - **Batch Upload**: Intelligent batching with size limits (100MB default)
 - **Retry Logic**: Built-in retry mechanism with exponential backoff
 - **Base64 Encoding**: Converts images to base64 for storage
 - **Configurable**: Command-line options for all parameters
 - **Dry Run Mode**: Test without actually uploading to Meilisearch
+- **Progress Tracking**: Real-time statistics and progress monitoring
 
 ## Installation
 
@@ -114,29 +116,32 @@ For public buckets, the application will attempt anonymous access if no credenti
 
 ## Performance
 
-The application is designed for high performance with:
+The application is designed for high performance and memory efficiency with:
 
-- Parallel S3 object listing with continuation tokens
-- Concurrent image downloads with semaphore-based rate limiting
-- Efficient monocolor detection using grid-based pixel sampling
-- Batch processing to minimize Meilisearch API calls
-- Built-in retry logic with exponential backoff for transient failures
-- Memory-efficient streaming processing
-- Progress tracking and detailed statistics
+- **Streaming S3 Processing**: Uses Rust Streams to process S3 objects without loading all keys into memory
+- **Constant Memory Usage**: Processes images in streaming batches, maintaining constant memory footprint regardless of dataset size
+- **Parallel S3 object listing**: Uses continuation tokens for paginated S3 API calls
+- **Concurrent image downloads**: Semaphore-based rate limiting for optimal throughput
+- **Efficient monocolor detection**: Grid-based pixel sampling with compression artifact tolerance
+- **Intelligent batch processing**: Minimizes Meilisearch API calls while respecting size limits
+- **Built-in retry logic**: Exponential backoff for transient failures
+- **Real-time progress tracking**: Detailed statistics and progress monitoring
 
 ### Performance Tuning
 
-- Adjust `--max-downloads` based on your network bandwidth and S3 rate limits
-- Adjust `--max-uploads` based on your Meilisearch instance capacity
-- Use `--batch-size` to control memory usage vs. API efficiency
-- Monitor the progress output to gauge optimal concurrency settings
+- Adjust `--max-downloads` based on your network bandwidth and S3 rate limits (default: 50)
+- Adjust `--max-uploads` based on your Meilisearch instance capacity (default: 10)
+- Use `--batch-size` to control processing batch size - larger batches improve parallelization (default: 100)
+- The streaming architecture maintains constant memory usage regardless of dataset size
+- Monitor the progress output to gauge optimal concurrency settings for your environment
 
 ## Image Processing
 
-- **Supported Formats**: JPEG, PNG
-- **Monocolor Detection**: Images with uniform color are filtered out
-- **Base64 Encoding**: All valid images are encoded to base64
-- **Error Handling**: Failed downloads/processing are logged but don't stop the process
+- **Supported Formats**: JPEG, PNG (detected by file extension)
+- **Advanced Monocolor Detection**: Grid-based pixel sampling with tolerance for compression artifacts (<1% variation threshold)
+- **Base64 Encoding**: All valid images are encoded to base64 for Meilisearch storage
+- **Streaming Processing**: Images are processed as they are discovered, not batched in memory
+- **Error Handling**: Failed downloads/processing are logged and counted but don't stop the process
 
 ## Dependencies
 

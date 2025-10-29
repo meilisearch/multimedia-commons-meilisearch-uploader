@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::Parser;
-use futures::{stream, StreamExt};
+use futures::{stream, Stream, StreamExt, TryStreamExt};
 use image::{ImageBuffer, Rgb};
 
 use rusty_s3::{Bucket, Credentials, S3Action};
@@ -482,40 +482,50 @@ async fn process_batch(ctx: Arc<AppContext>, keys: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-async fn list_all_image_keys(ctx: &AppContext) -> Result<Vec<String>> {
-    let mut all_keys = Vec::new();
-    let mut continuation_token = None;
+fn image_keys_stream(ctx: Arc<AppContext>) -> impl Stream<Item = Result<String>> {
+    stream::unfold(
+        (ctx, None::<String>),
+        |(ctx, continuation_token)| async move {
+            match list_s3_objects(&ctx, &ctx.args.prefix, continuation_token).await {
+                Ok(response) => {
+                    let image_keys: Vec<Result<String>> = response
+                        .contents
+                        .into_iter()
+                        .filter_map(|obj| {
+                            if is_image_file(&obj.key) {
+                                Some(Ok(obj.key))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
 
-    loop {
-        let response = list_s3_objects(ctx, &ctx.args.prefix, continuation_token).await?;
+                    let next_token = if response.is_truncated {
+                        response.next_continuation_token
+                    } else {
+                        None
+                    };
 
-        let image_keys: Vec<String> = response
-            .contents
-            .into_iter()
-            .filter_map(|obj| {
-                if is_image_file(&obj.key) {
-                    Some(obj.key)
-                } else {
-                    None
+                    if image_keys.is_empty() && next_token.is_some() {
+                        // Continue to next page if no images found but more pages exist
+                        Some((stream::iter(vec![]), (ctx, next_token)))
+                    } else {
+                        let keys_stream = stream::iter(image_keys);
+                        if next_token.is_some() {
+                            Some((keys_stream, (ctx, next_token)))
+                        } else {
+                            Some((keys_stream, (ctx, None)))
+                        }
+                    }
                 }
-            })
-            .collect();
-
-        all_keys.extend(image_keys);
-
-        if !response.is_truncated {
-            break;
-        }
-
-        continuation_token = response.next_continuation_token;
-
-        if continuation_token.is_none() {
-            break;
-        }
-    }
-
-    println!("Found {} image files in S3", all_keys.len());
-    Ok(all_keys)
+                Err(e) => {
+                    eprintln!("Error listing S3 objects: {}", e);
+                    Some((stream::iter(vec![Err(e)]), (ctx, None)))
+                }
+            }
+        },
+    )
+    .flatten()
 }
 
 #[tokio::main]
@@ -535,48 +545,95 @@ async fn main() -> Result<()> {
 
     let ctx = Arc::new(AppContext::new(args)?);
 
-    // List all image files
-    let all_keys = list_all_image_keys(&ctx).await?;
+    println!("Starting to stream image files from S3...");
 
-    if all_keys.is_empty() {
-        println!("No image files found in S3 bucket");
-        return Ok(());
-    }
+    // Create the image keys stream
+    let image_stream = image_keys_stream(ctx.clone());
 
-    println!("Found {} images to process", all_keys.len());
-
-    // Update total found in stats
-    {
-        let mut stats = ctx.stats.lock().await;
-        stats.total_found = all_keys.len() as u64;
-    }
-
-    // Process in parallel batches
-    let batch_futures = all_keys
-        .chunks(ctx.args.batch_size * 2) // Process larger chunks to improve parallelization
-        .map(|chunk| {
-            let ctx = ctx.clone();
-            let keys = chunk.to_vec();
-            tokio::spawn(async move { process_batch(ctx, keys).await })
-        });
-
-    // Wait for all batches to complete
-    let results = futures::future::join_all(batch_futures).await;
-
+    // Process images in streaming batches
+    let mut batch_buffer = Vec::with_capacity(ctx.args.batch_size * 2);
+    let mut total_found = 0u64;
+    let mut batch_count = 0;
     let mut errors = 0;
-    for result in results {
-        match result {
+
+    let mut stream = Box::pin(image_stream);
+
+    while let Some(key_result) = stream.try_next().await? {
+        batch_buffer.push(key_result);
+        total_found += 1;
+
+        // Update stats periodically
+        if total_found % 1000 == 0 {
+            let mut stats = ctx.stats.lock().await;
+            stats.total_found = total_found;
+            println!("Found {} image files so far...", total_found);
+        }
+
+        // Process batch when buffer is full
+        if batch_buffer.len() >= ctx.args.batch_size * 2 {
+            batch_count += 1;
+            println!(
+                "Processing batch {} ({} images)",
+                batch_count,
+                batch_buffer.len()
+            );
+
+            let keys_to_process = std::mem::take(&mut batch_buffer);
+            let ctx_clone = ctx.clone();
+
+            match tokio::spawn(async move { process_batch(ctx_clone, keys_to_process).await }).await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    eprintln!("Batch {} processing error: {}", batch_count, e);
+                    errors += 1;
+                }
+                Err(e) => {
+                    eprintln!("Batch {} task join error: {}", batch_count, e);
+                    errors += 1;
+                }
+            }
+        }
+    }
+
+    // Process remaining images in buffer
+    if !batch_buffer.is_empty() {
+        batch_count += 1;
+        println!(
+            "Processing final batch {} ({} images)",
+            batch_count,
+            batch_buffer.len()
+        );
+
+        let ctx_clone = ctx.clone();
+        match tokio::spawn(async move { process_batch(ctx_clone, batch_buffer).await }).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                eprintln!("Batch processing error: {}", e);
+                eprintln!("Final batch processing error: {}", e);
                 errors += 1;
             }
             Err(e) => {
-                eprintln!("Task join error: {}", e);
+                eprintln!("Final batch task join error: {}", e);
                 errors += 1;
             }
         }
     }
+
+    // Update final stats
+    {
+        let mut stats = ctx.stats.lock().await;
+        stats.total_found = total_found;
+    }
+
+    if total_found == 0 {
+        println!("No image files found in S3 bucket");
+        return Ok(());
+    }
+
+    println!(
+        "Completed processing {} total images in {} batches",
+        total_found, batch_count
+    );
 
     // Print final statistics
     let stats = ctx.stats.lock().await;
