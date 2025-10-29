@@ -15,6 +15,8 @@ use url::Url;
 
 const MAX_RETRIES: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_IMAGE_SIZE_BYTES: usize = 50 * 1024 * 1024; // 50MB per image
+const MAX_BASE64_SIZE: usize = 100 * 1024 * 1024; // 100MB base64 limit
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -307,6 +309,15 @@ async fn download_and_process_image(
         }
     };
 
+    // Log large images but don't skip them - let the batch uploader handle sizing
+    if image_bytes.len() > MAX_IMAGE_SIZE_BYTES {
+        println!(
+            "Warning: Large image {} ({} bytes) - will be sent in separate batch",
+            key,
+            image_bytes.len()
+        );
+    }
+
     // Load and decode the image
     let img = match image::load_from_memory(&image_bytes) {
         Ok(img) => img.to_rgb8(),
@@ -332,13 +343,48 @@ async fn download_and_process_image(
         return Ok(None);
     }
 
-    // Encode to base64
+    // Encode to base64 and validate
     let base64_data = general_purpose::STANDARD.encode(&image_bytes);
 
+    // Log very large base64 but don't skip - let batch uploader handle it
+    if base64_data.len() > MAX_BASE64_SIZE {
+        println!(
+            "Warning: Very large base64 for {} ({} bytes) - will be sent in separate batch",
+            key,
+            base64_data.len()
+        );
+    }
+
+    // Validate base64 encoding is valid UTF-8 and contains only valid base64 characters
+    if !base64_data.is_ascii()
+        || !base64_data
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=')
+    {
+        eprintln!(
+            "Warning: Base64 encoding produced invalid characters for {}",
+            key
+        );
+        return Ok(None);
+    }
+
+    // Create and validate document
+    let id = extract_id_from_key(&key);
+    let url = build_public_url(&key, &ctx.args.bucket, &ctx.args.region);
+
+    // Validate document fields don't contain problematic characters
+    if id.chars().any(|c| c.is_control()) || url.chars().any(|c| c.is_control()) {
+        eprintln!(
+            "Warning: Document contains control characters, skipping: {}",
+            key
+        );
+        return Ok(None);
+    }
+
     let document = ImageDocument {
-        id: extract_id_from_key(&key),
+        id,
         base64: base64_data,
-        url: build_public_url(&key, &ctx.args.bucket, &ctx.args.region),
+        url,
     };
 
     if ctx.args.max_downloads <= 20 {
@@ -372,6 +418,49 @@ async fn upload_batch_to_meilisearch(
         return Ok(());
     }
 
+    // For single large documents, validate they can be serialized
+    if documents.len() == 1 {
+        let estimated_size = estimate_document_size(&documents[0]);
+        if estimated_size > ctx.args.max_batch_bytes * 2 {
+            // If document is more than 2x the batch limit, it might be too large for Meilisearch
+            println!(
+                "Warning: Document {} is extremely large ({} bytes estimated), attempting upload anyway",
+                documents[0].id, estimated_size
+            );
+        }
+    }
+
+    // Validate and serialize JSON first to catch issues early
+    let json_payload = match serde_json::to_string(&documents) {
+        Ok(json) => json,
+        Err(e) => {
+            eprintln!("Failed to serialize documents to JSON: {}", e);
+            eprintln!("Problematic batch had {} documents", documents.len());
+            // Log first document for debugging
+            if let Some(first_doc) = documents.first() {
+                eprintln!("First document ID: {}", first_doc.id);
+                eprintln!("First document base64 length: {}", first_doc.base64.len());
+                eprintln!("First document URL: {}", first_doc.url);
+            }
+            return Err(anyhow::anyhow!("JSON serialization failed: {}", e));
+        }
+    };
+
+    // Log payload size for monitoring
+    let payload_size = json_payload.len();
+    if documents.len() == 1 && payload_size > ctx.args.max_batch_bytes {
+        println!(
+            "Uploading oversized single document: {} bytes ({}x larger than batch limit)",
+            payload_size,
+            payload_size / ctx.args.max_batch_bytes
+        );
+    } else if payload_size > ctx.args.max_batch_bytes {
+        println!(
+            "Warning: Batch payload size {} exceeds configured max {} bytes",
+            payload_size, ctx.args.max_batch_bytes
+        );
+    }
+
     let url = format!("{}/indexes/images/documents", ctx.args.meilisearch_url);
 
     let upload_operation = || async {
@@ -383,7 +472,7 @@ async fn upload_batch_to_meilisearch(
                 &format!("Bearer {}", ctx.args.meilisearch_key),
             )
             .header("Content-Type", "application/json")
-            .json(&documents)
+            .body(json_payload.clone())
             .send()
             .await
             .context("Failed to upload batch to Meilisearch")?;
@@ -391,6 +480,18 @@ async fn upload_batch_to_meilisearch(
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
+            eprintln!(
+                "Meilisearch upload failed. Payload size: {} bytes",
+                payload_size
+            );
+            eprintln!(
+                "First 1000 chars of payload: {}",
+                if json_payload.len() > 1000 {
+                    &json_payload[..1000]
+                } else {
+                    &json_payload
+                }
+            );
             return Err(anyhow::anyhow!(
                 "Meilisearch upload failed with status {}: {}",
                 status,
@@ -416,8 +517,14 @@ async fn upload_batch_to_meilisearch(
 }
 
 fn estimate_document_size(doc: &ImageDocument) -> usize {
-    // Rough estimate of JSON serialized size
-    doc.id.len() + doc.base64.len() + doc.url.len() + 100 // extra for JSON overhead
+    // More accurate estimate of JSON serialized size
+    // JSON structure: {"id":"...","base64":"...","url":"..."}
+    // Account for quotes, colons, commas, braces, and field names
+    let field_names_overhead = "id".len() + "base64".len() + "url".len(); // 13 bytes
+    let json_syntax_overhead = 2 + 6 + 4 + 2; // braces + quotes + colons + commas = 14 bytes
+    let content_size = doc.id.len() + doc.base64.len() + doc.url.len();
+
+    content_size + field_names_overhead + json_syntax_overhead + 50 // extra buffer for safety
 }
 
 async fn batch_uploader(
@@ -431,10 +538,39 @@ async fn batch_uploader(
     while let Some(document) = document_receiver.recv().await {
         let doc_size = estimate_document_size(&document);
 
-        // Check if we need to upload the current batch
+        // If this single document exceeds max batch size, send it alone
+        if doc_size > ctx.args.max_batch_bytes {
+            // Upload current batch first if it has documents
+            if !current_batch.is_empty() {
+                batch_count += 1;
+                if let Err(e) =
+                    upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
+                {
+                    eprintln!("Failed to upload batch {}: {}", batch_count, e);
+                }
+                current_size = 0;
+            }
+
+            // Send the large document alone
+            batch_count += 1;
+            println!(
+                "Sending oversized document {} ({} bytes) in separate batch {}",
+                document.id, doc_size, batch_count
+            );
+            if let Err(e) = upload_batch_to_meilisearch(&ctx, vec![document]).await {
+                eprintln!(
+                    "Failed to upload large document batch {}: {}",
+                    batch_count, e
+                );
+            }
+            continue;
+        }
+
+        // Check if adding this document would exceed limits
         if current_batch.len() >= ctx.args.batch_size
             || (current_size + doc_size) > ctx.args.max_batch_bytes && !current_batch.is_empty()
         {
+            // Upload current batch
             batch_count += 1;
             if let Err(e) =
                 upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
@@ -444,6 +580,7 @@ async fn batch_uploader(
             current_size = 0;
         }
 
+        // Add document to current batch
         current_batch.push(document);
         current_size += doc_size;
     }

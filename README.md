@@ -10,7 +10,7 @@ A high-performance Rust application with a concurrent pipeline architecture that
 - **S3 Integration**: Recursively scans S3 buckets using rusty-s3 with pagination
 - **Parallel Image Processing**: Configurable concurrent image downloads and processing
 - **Intelligent Filtering**: Advanced monocolor detection with compression artifact tolerance
-- **Smart Batching**: Dynamic batch uploading with size and count limits
+- **Intelligent Batching**: Dynamic batch uploading with adaptive sizing - never skips large images
 - **Built-in Resilience**: Retry logic with exponential backoff for transient failures
 - **Base64 Encoding**: Converts images to base64 for Meilisearch storage
 - **Highly Configurable**: Command-line options for all performance parameters
@@ -138,7 +138,7 @@ continuously            processes images            Meilisearch
 ### Performance Features
 - **S3 Streaming**: Continuous S3 object discovery with pagination
 - **Parallel Processing**: Up to N concurrent image downloads/processing (configurable)
-- **Smart Batching**: Dynamic batching with size and count limits for optimal API usage
+- **Adaptive Batching**: Intelligent batch sizing that handles large images by sending them separately
 - **Advanced Filtering**: Grid-based monocolor detection with compression tolerance
 - **Retry Logic**: Exponential backoff for transient failures
 - **Real-time Stats**: Live progress monitoring across all pipeline stages
@@ -151,8 +151,9 @@ continuously            processes images            Meilisearch
   - Tune based on your system resources and S3 rate limits
 - `--max-uploads`: Controls Meilisearch upload concurrency (default: 10)
   - Tune based on your Meilisearch instance capacity
-- `--batch-size`: Documents per upload batch (default: 100)
+- `--batch-size`: Target documents per upload batch (default: 100)
   - Larger batches = fewer API calls but more memory per batch
+  - Large images are automatically sent in separate batches to ensure no data loss
 
 **Memory Management:**
 - Channel buffer sizes are automatically tuned for optimal memory usage
@@ -170,6 +171,8 @@ continuously            processes images            Meilisearch
 - **Base64 Encoding**: All valid images are encoded to base64 for Meilisearch storage
 - **Pipeline Processing**: Images flow through the pipeline as discovered - no batching in memory
 - **Concurrent Downloads**: Multiple images processed simultaneously with semaphore-based rate limiting
+- **Adaptive Upload Strategy**: Large images that exceed batch size limits are sent in separate batches
+- **Zero Data Loss**: No images are skipped due to size - all valid images are uploaded
 - **Graceful Error Handling**: Failed downloads/processing are logged and counted but don't stop the pipeline
 
 ## Dependencies
@@ -202,8 +205,9 @@ The application includes comprehensive error handling:
 2. **Access Denied**: Verify your AWS credentials have S3 read permissions
 3. **Out of Memory**: Reduce `--max-downloads` if processing very large images (the pipeline itself uses constant memory)
 4. **Slow Processing**: Increase `--max-downloads` for more parallel processing, but watch system resources
-5. **Meilisearch Errors**: Check that your Meilisearch URL and API key are correct
-6. **Pipeline Stalls**: If one stage becomes a bottleneck, tune the related concurrency parameters
+5. **Large Image Handling**: Very large images are automatically sent in separate batches with logging
+6. **Meilisearch Errors**: Check that your Meilisearch URL and API key are correct
+7. **Pipeline Stalls**: If one stage becomes a bottleneck, tune the related concurrency parameters
 
 ### Testing
 
@@ -215,6 +219,9 @@ Use the `--dry-run` flag to test the pipeline without uploading to Meilisearch:
 
 # Test with higher concurrency for performance evaluation
 ./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-downloads 20 --batch-size 50
+
+# Test batch handling with smaller limits to see adaptive batching
+./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-batch-bytes 100000 --batch-size 3
 ```
 
 ## License
