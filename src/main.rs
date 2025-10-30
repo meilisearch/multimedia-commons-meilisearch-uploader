@@ -95,6 +95,7 @@ struct Statistics {
     decode_errors: u64,
     download_errors: u64,
     uploaded: u64,
+    deleted: u64,
 }
 
 struct AppContext {
@@ -335,14 +336,12 @@ async fn download_and_process_image(
     if is_monocolor_image(&img) {
         if ctx.args.max_downloads <= 20 {
             println!(
-                "Skipping low-color image: {} (< {} unique colors)",
+                "Deleting low-color image: {} (< {} unique colors)",
                 key, MIN_UNIQUE_COLORS
             );
         }
-        {
-            let mut stats = ctx.stats.lock().await;
-            stats.monocolor_filtered += 1;
-        }
+
+        // Return None to indicate this image should be deleted
         return Ok(None);
     }
 
@@ -519,6 +518,62 @@ async fn upload_batch_to_meilisearch(
     Ok(())
 }
 
+async fn batch_delete_from_meilisearch(ctx: &AppContext, image_ids: Vec<String>) -> Result<()> {
+    if image_ids.is_empty() {
+        return Ok(());
+    }
+
+    if ctx.args.dry_run {
+        println!(
+            "Dry run mode: would delete {} images: {:?}",
+            image_ids.len(),
+            image_ids
+        );
+        return Ok(());
+    }
+
+    println!(
+        "Deleting batch of {} low-color images from Meilisearch",
+        image_ids.len()
+    );
+
+    let url = format!(
+        "{}/indexes/images/documents/delete-batch",
+        ctx.args.meilisearch_url
+    );
+
+    let delete_operation = || async {
+        let response = ctx
+            .http_client
+            .post(&url)
+            .header(
+                "Authorization",
+                &format!("Bearer {}", ctx.args.meilisearch_key),
+            )
+            .header("Content-Type", "application/json")
+            .json(&image_ids)
+            .send()
+            .await
+            .context("Failed to delete batch from Meilisearch")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!(
+                "Meilisearch batch deletion failed with status {}: {}",
+                status,
+                text
+            ));
+        }
+
+        Ok(())
+    };
+
+    retry_with_backoff(delete_operation).await?;
+    println!("Successfully deleted batch of {} images", image_ids.len());
+    Ok(())
+}
+
 fn estimate_document_size(doc: &ImageDocument) -> usize {
     // More accurate estimate of JSON serialized size
     // JSON structure: {"id":"...","base64":"...","url":"..."}
@@ -533,59 +588,87 @@ fn estimate_document_size(doc: &ImageDocument) -> usize {
 async fn batch_uploader(
     ctx: Arc<AppContext>,
     mut document_receiver: tokio::sync::mpsc::Receiver<ImageDocument>,
+    mut deletion_receiver: tokio::sync::mpsc::Receiver<String>,
 ) -> Result<()> {
     let mut current_batch = Vec::new();
     let mut current_size = 0;
     let mut batch_count = 0;
+    let mut deletion_batch = Vec::new();
 
-    while let Some(document) = document_receiver.recv().await {
-        let doc_size = estimate_document_size(&document);
+    loop {
+        tokio::select! {
+            document = document_receiver.recv() => {
+                if let Some(document) = document {
+                    let doc_size = estimate_document_size(&document);
 
-        // If this single document exceeds max batch size, send it alone
-        if doc_size > ctx.args.max_batch_bytes {
-            // Upload current batch first if it has documents
-            if !current_batch.is_empty() {
-                batch_count += 1;
-                if let Err(e) =
-                    upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
-                {
-                    eprintln!("Failed to upload batch {}: {}", batch_count, e);
+                    // If this single document exceeds max batch size, send it alone
+                    if doc_size > ctx.args.max_batch_bytes {
+                        // Upload current batch first if it has documents
+                        if !current_batch.is_empty() {
+                            batch_count += 1;
+                            if let Err(e) =
+                                upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
+                            {
+                                eprintln!("Failed to upload batch {}: {}", batch_count, e);
+                            }
+                            current_size = 0;
+                        }
+
+                        // Send the large document alone
+                        batch_count += 1;
+                        println!(
+                            "Sending oversized document {} ({} bytes) in separate batch {}",
+                            document.id, doc_size, batch_count
+                        );
+                        if let Err(e) = upload_batch_to_meilisearch(&ctx, vec![document]).await {
+                            eprintln!(
+                                "Failed to upload large document batch {}: {}",
+                                batch_count, e
+                            );
+                        }
+                        continue;
+                    }
+
+                    // Check if adding this document would exceed limits
+                    if current_batch.len() >= ctx.args.batch_size
+                        || (current_size + doc_size) > ctx.args.max_batch_bytes && !current_batch.is_empty()
+                    {
+                        // Upload current batch
+                        batch_count += 1;
+                        if let Err(e) =
+                            upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
+                        {
+                            eprintln!("Failed to upload batch {}: {}", batch_count, e);
+                        }
+                        current_size = 0;
+                    }
+
+                    // Add document to current batch
+                    current_batch.push(document);
+                    current_size += doc_size;
+                } else {
+                    // Document channel closed, break to finalize
+                    break;
                 }
-                current_size = 0;
             }
+            deletion_id = deletion_receiver.recv() => {
+                if let Some(id) = deletion_id {
+                    deletion_batch.push(id);
 
-            // Send the large document alone
-            batch_count += 1;
-            println!(
-                "Sending oversized document {} ({} bytes) in separate batch {}",
-                document.id, doc_size, batch_count
-            );
-            if let Err(e) = upload_batch_to_meilisearch(&ctx, vec![document]).await {
-                eprintln!(
-                    "Failed to upload large document batch {}: {}",
-                    batch_count, e
-                );
+                    // Process deletion batch when it reaches a good size or every few seconds
+                    if deletion_batch.len() >= 50 {
+                        let batch_size = deletion_batch.len();
+                        if let Err(e) = batch_delete_from_meilisearch(&ctx, std::mem::take(&mut deletion_batch)).await {
+                            eprintln!("Failed to delete batch: {}", e);
+                        } else {
+                            let mut stats = ctx.stats.lock().await;
+                            stats.monocolor_filtered += batch_size as u64;
+                            stats.deleted += batch_size as u64;
+                        }
+                    }
+                }
             }
-            continue;
         }
-
-        // Check if adding this document would exceed limits
-        if current_batch.len() >= ctx.args.batch_size
-            || (current_size + doc_size) > ctx.args.max_batch_bytes && !current_batch.is_empty()
-        {
-            // Upload current batch
-            batch_count += 1;
-            if let Err(e) =
-                upload_batch_to_meilisearch(&ctx, std::mem::take(&mut current_batch)).await
-            {
-                eprintln!("Failed to upload batch {}: {}", batch_count, e);
-            }
-            current_size = 0;
-        }
-
-        // Add document to current batch
-        current_batch.push(document);
-        current_size += doc_size;
     }
 
     // Upload remaining documents
@@ -593,6 +676,18 @@ async fn batch_uploader(
         batch_count += 1;
         if let Err(e) = upload_batch_to_meilisearch(&ctx, current_batch).await {
             eprintln!("Failed to upload final batch {}: {}", batch_count, e);
+        }
+    }
+
+    // Delete remaining low-color images
+    if !deletion_batch.is_empty() {
+        let batch_size = deletion_batch.len();
+        if let Err(e) = batch_delete_from_meilisearch(&ctx, deletion_batch).await {
+            eprintln!("Failed to delete final batch: {}", e);
+        } else {
+            let mut stats = ctx.stats.lock().await;
+            stats.monocolor_filtered += batch_size as u64;
+            stats.deleted += batch_size as u64;
         }
     }
 
@@ -604,12 +699,14 @@ async fn image_processor(
     ctx: Arc<AppContext>,
     mut key_receiver: tokio::sync::mpsc::Receiver<String>,
     document_sender: tokio::sync::mpsc::Sender<ImageDocument>,
+    deletion_sender: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let mut tasks = tokio::task::JoinSet::new();
 
     while let Some(key) = key_receiver.recv().await {
         let ctx = ctx.clone();
         let sender = document_sender.clone();
+        let del_sender = deletion_sender.clone();
 
         // Limit concurrent processing
         while tasks.len() >= ctx.args.max_downloads {
@@ -622,6 +719,7 @@ async fn image_processor(
         }
 
         tasks.spawn(async move {
+            let key_copy = key.clone();
             match download_and_process_image(&ctx, key).await {
                 Ok(Some(document)) => {
                     if sender.send(document).await.is_err() {
@@ -629,7 +727,11 @@ async fn image_processor(
                     }
                 }
                 Ok(None) => {
-                    // Image was filtered or failed processing
+                    // Image was filtered (low-color), send for deletion
+                    let id = extract_id_from_key(&key_copy);
+                    if del_sender.send(id).await.is_err() {
+                        eprintln!("Failed to send deletion ID to batch deleter");
+                    }
                 }
                 Err(e) => {
                     eprintln!("Error processing image: {}", e);
@@ -735,6 +837,7 @@ async fn main() -> Result<()> {
     // Create channels for the pipeline
     let (key_sender, key_receiver) = tokio::sync::mpsc::channel::<String>(1000);
     let (document_sender, document_receiver) = tokio::sync::mpsc::channel::<ImageDocument>(100);
+    let (deletion_sender, deletion_receiver) = tokio::sync::mpsc::channel::<String>(500);
 
     // Start the three concurrent tasks
     let s3_task = {
@@ -744,12 +847,14 @@ async fn main() -> Result<()> {
 
     let processor_task = {
         let ctx = ctx.clone();
-        tokio::spawn(async move { image_processor(ctx, key_receiver, document_sender).await })
+        tokio::spawn(async move {
+            image_processor(ctx, key_receiver, document_sender, deletion_sender).await
+        })
     };
 
     let uploader_task = {
         let ctx = ctx.clone();
-        tokio::spawn(async move { batch_uploader(ctx, document_receiver).await })
+        tokio::spawn(async move { batch_uploader(ctx, document_receiver, deletion_receiver).await })
     };
 
     // Wait for all tasks to complete
@@ -780,6 +885,7 @@ async fn main() -> Result<()> {
         "Low-color filtered (< {} colors): {}",
         MIN_UNIQUE_COLORS, stats.monocolor_filtered
     );
+    println!("Low-color images deleted: {}", stats.deleted);
     println!("Decode errors: {}", stats.decode_errors);
     println!("Download errors: {}", stats.download_errors);
     println!("Successfully uploaded: {}", stats.uploaded);

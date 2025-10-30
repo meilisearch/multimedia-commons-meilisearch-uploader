@@ -11,6 +11,7 @@ A high-performance Rust application with a concurrent pipeline architecture that
 - **Parallel Image Processing**: Configurable concurrent image downloads and processing
 - **Intelligent Filtering**: Advanced monocolor detection with compression artifact tolerance
 - **Intelligent Batching**: Dynamic batch uploading with adaptive sizing - never skips large images
+- **Batch Deletion**: Efficiently removes low-color images using Meilisearch's batch delete API
 - **Built-in Resilience**: Retry logic with exponential backoff for transient failures
 - **Base64 Encoding**: Converts images to base64 for Meilisearch storage
 - **Highly Configurable**: Command-line options for all performance parameters
@@ -139,6 +140,7 @@ continuously            processes images            Meilisearch
 - **S3 Streaming**: Continuous S3 object discovery with pagination
 - **Parallel Processing**: Up to N concurrent image downloads/processing (configurable)
 - **Adaptive Batching**: Intelligent batch sizing that handles large images by sending them separately
+- **Batch Deletion**: Groups low-color image deletions into batches of 50 for efficient API usage
 - **Advanced Filtering**: Grid-based monocolor detection with compression tolerance
 - **Retry Logic**: Exponential backoff for transient failures
 - **Real-time Stats**: Live progress monitoring across all pipeline stages
@@ -167,12 +169,13 @@ continuously            processes images            Meilisearch
 ## Image Processing
 
 - **Supported Formats**: JPEG, PNG (detected by file extension)
-- **Advanced Monocolor Detection**: Grid-based pixel sampling with tolerance for compression artifacts (<1% variation threshold)
+- **Advanced Color Analysis**: Counts unique colors per image (minimum 40 colors to be considered rich content)
 - **Base64 Encoding**: All valid images are encoded to base64 for Meilisearch storage
 - **Pipeline Processing**: Images flow through the pipeline as discovered - no batching in memory
 - **Concurrent Downloads**: Multiple images processed simultaneously with semaphore-based rate limiting
 - **Adaptive Upload Strategy**: Large images that exceed batch size limits are sent in separate batches
-- **Zero Data Loss**: No images are skipped due to size - all valid images are uploaded
+- **Batch Deletion Strategy**: Low-color images are queued and deleted in batches of 50 using Meilisearch's batch API
+- **Zero Data Loss**: All images are processed - rich images uploaded, simple images deleted from index
 - **Graceful Error Handling**: Failed downloads/processing are logged and counted but don't stop the pipeline
 
 ## Dependencies
@@ -222,6 +225,9 @@ Use the `--dry-run` flag to test the pipeline without uploading to Meilisearch:
 
 # Test batch handling with smaller limits to see adaptive batching
 ./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-batch-bytes 100000 --batch-size 3
+
+# See what would be deleted vs uploaded
+./target/release/multimedia-commons-meilisearch-uploader --dry-run --max-downloads 50
 ```
 
 ## License
