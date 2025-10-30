@@ -17,6 +17,7 @@ const MAX_RETRIES: usize = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 const MAX_IMAGE_SIZE_BYTES: usize = 50 * 1024 * 1024; // 50MB per image
 const MAX_BASE64_SIZE: usize = 100 * 1024 * 1024; // 100MB base64 limit
+const MIN_UNIQUE_COLORS: usize = 40; // Minimum colors to not be considered "simple"
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -151,37 +152,36 @@ fn is_monocolor_image(img: &ImageBuffer<Rgb<u8>, Vec<u8>>) -> bool {
         return true;
     }
 
-    let first_pixel = img.get_pixel(0, 0);
-    let first_color = first_pixel.0;
+    // Use HashSet to count unique colors efficiently
+    let mut unique_colors = std::collections::HashSet::new();
 
     // Sample pixels across the image for performance
-    // Use a grid sampling approach with at least 100 samples for better accuracy
-    let samples_per_dim = std::cmp::max(10, std::cmp::min(width, height) / 50);
+    // Use a grid sampling approach for better coverage
+    let samples_per_dim = std::cmp::max(20, std::cmp::min(width, height) / 25);
     let x_step = std::cmp::max(1, width / samples_per_dim);
     let y_step = std::cmp::max(1, height / samples_per_dim);
-
-    let mut different_pixels = 0;
-    let mut total_samples = 0;
 
     for y in (0..height).step_by(y_step as usize) {
         for x in (0..width).step_by(x_step as usize) {
             let pixel = img.get_pixel(x, y);
-            total_samples += 1;
+            // Quantize colors slightly to account for compression artifacts
+            // Round each channel to nearest 4 (reduces noise while preserving distinct colors)
+            let quantized_color = (
+                (pixel.0[0] / 4) * 4,
+                (pixel.0[1] / 4) * 4,
+                (pixel.0[2] / 4) * 4,
+            );
+            unique_colors.insert(quantized_color);
 
-            // Allow for small variations due to compression artifacts
-            let r_diff = (pixel.0[0] as i16 - first_color[0] as i16).abs();
-            let g_diff = (pixel.0[1] as i16 - first_color[1] as i16).abs();
-            let b_diff = (pixel.0[2] as i16 - first_color[2] as i16).abs();
-
-            if r_diff > 5 || g_diff > 5 || b_diff > 5 {
-                different_pixels += 1;
+            // Early exit if we already have enough colors
+            if unique_colors.len() >= 40 {
+                return false;
             }
         }
     }
 
-    // Consider image monocolor if less than 1% of samples show significant variation
-    let variation_ratio = different_pixels as f64 / total_samples as f64;
-    variation_ratio < 0.01
+    // Image has too few colors if it has less than 40 unique colors
+    unique_colors.len() < 40
 }
 
 fn extract_id_from_key(key: &str) -> String {
@@ -331,10 +331,13 @@ async fn download_and_process_image(
         }
     };
 
-    // Filter out monocolor images
+    // Filter out images with too few colors (simple graphics, documents, etc.)
     if is_monocolor_image(&img) {
         if ctx.args.max_downloads <= 20 {
-            println!("Skipping monocolor image: {}", key);
+            println!(
+                "Skipping low-color image: {} (< {} unique colors)",
+                key, MIN_UNIQUE_COLORS
+            );
         }
         {
             let mut stats = ctx.stats.lock().await;
@@ -773,7 +776,10 @@ async fn main() -> Result<()> {
     println!("\n=== Final Statistics ===");
     println!("Total images found: {}", stats.total_found);
     println!("Successfully processed: {}", stats.processed);
-    println!("Monocolor filtered: {}", stats.monocolor_filtered);
+    println!(
+        "Low-color filtered (< {} colors): {}",
+        MIN_UNIQUE_COLORS, stats.monocolor_filtered
+    );
     println!("Decode errors: {}", stats.decode_errors);
     println!("Download errors: {}", stats.download_errors);
     println!("Successfully uploaded: {}", stats.uploaded);
